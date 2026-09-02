@@ -1,7 +1,7 @@
 {
   "name": "kill-doc",
-  "version": "9.0.0",
-  "description": "文档免费下载 - Tampermonkey 油猴用户脚本 (单次点击全自动生成 1:1 PDF)",
+  "version": "9.1.0",
+  "description": "文档免费下载 - Tampermonkey 油猴用户脚本 (一键自动生成 1:1 PDF & 支持中断下载)",
   "main": "main.js",
   "scripts": {
     "build": "node main.js"

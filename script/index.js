@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         文档免费下载
 // @namespace    https://github.com/wayner6/kill-doc
-// @version      9.0.0
-// @description  基于 kill-doc 深度重构。单次点击一键全自动全量渲染并导出高清 1:1 原貌尺寸 PDF，智能裁切消除白边，支持一键旋转校正。
+// @version      9.1.0
+// @description  基于 kill-doc 深度重构。单次点击一键全自动渲染并导出高清 1:1 原貌尺寸 PDF，智能裁切消除白边，支持随时中断下载。
 // @author       kill-doc-dev
 // @downloadURL  https://raw.githubusercontent.com/wayner6/kill-doc/master/script/index.js
 // @updateURL    https://raw.githubusercontent.com/wayner6/kill-doc/master/script/index.js
@@ -119,6 +119,14 @@
 		.${prefix}active:hover {
 			background-color: #f0fff4;
 			color: #28a745;
+		}
+		#${prefix}stop {
+			border-color: #dc3545;
+			color: #dc3545;
+		}
+		#${prefix}stop:hover {
+			background-color: #dc3545;
+			color: #ffffff;
 		}
 		@media print {
 			html { height: auto !important; }
@@ -294,56 +302,17 @@
 
 	let doc = null;
 	let collectedImages = [];
-	let currentRotation = 0; // 0, 90, 180, 270
 	let title = document.title;
 	let select = null;
 	let dom = null;
 	let beforeFun = null;
 	let isRunning = false;
+	let isAborted = false;
 
 	// ==================== PDF 与图像处理核心引擎 ====================
 	const resetState = () => {
 		doc = null;
 		collectedImages = [];
-	};
-
-	const rotateCanvas = (canvas, degrees) => {
-		if (!degrees || degrees % 360 === 0) return canvas;
-		const deg = (degrees % 360 + 360) % 360;
-		const rad = deg * Math.PI / 180;
-		const rotated = document.createElement('canvas');
-		if (deg === 90 || deg === 270) {
-			rotated.width = canvas.height;
-			rotated.height = canvas.width;
-		} else {
-			rotated.width = canvas.width;
-			rotated.height = canvas.height;
-		}
-		const ctx = rotated.getContext('2d');
-		ctx.fillStyle = '#FFFFFF';
-		ctx.fillRect(0, 0, rotated.width, rotated.height);
-		ctx.translate(rotated.width / 2, rotated.height / 2);
-		ctx.rotate(rad);
-		ctx.drawImage(canvas, -canvas.width / 2, -canvas.height / 2);
-		return rotated;
-	};
-
-	const getElementRotation = (el) => {
-		let curr = el;
-		while (curr && curr !== document.body) {
-			const style = window.getComputedStyle(curr);
-			const transform = style.transform || style.webkitTransform;
-			if (transform && transform !== 'none') {
-				const match = transform.match(/matrix\(([^)]+)\)/);
-				if (match) {
-					const values = match[1].split(',').map(parseFloat);
-					const angle = Math.round(Math.atan2(values[1], values[0]) * (180 / Math.PI));
-					if (angle !== 0) return (angle + 360) % 360;
-				}
-			}
-			curr = curr.parentElement;
-		}
-		return 0;
 	};
 
 	const cropCanvasWhiteBorders = (canvas) => {
@@ -407,20 +376,16 @@
 		return canvas;
 	};
 
-	const savePageToPDF = (imageData, i, width, height) => {
-		const naturalW = width || (imageData && (imageData.naturalWidth || imageData.width)) || 595;
-		const naturalH = height || (imageData && (imageData.naturalHeight || imageData.height)) || 842;
-		const target_w = Math.round(naturalW);
-		const target_h = Math.round(naturalH);
+	const savePageToPDF = (canvasOrImg, i, width, height) => {
+		const target_w = Math.round(width || (canvasOrImg && (canvasOrImg.naturalWidth || canvasOrImg.width)) || 595);
+		const target_h = Math.round(height || (canvasOrImg && (canvasOrImg.naturalHeight || canvasOrImg.height)) || 842);
 		const dir = target_w > target_h ? 'l' : 'p';
 
 		let dataUrl = '';
-		if (imageData && typeof imageData.toDataURL === 'function') {
+		if (canvasOrImg && typeof canvasOrImg.toDataURL === 'function') {
 			try {
-				dataUrl = imageData.toDataURL('image/jpeg', 0.95);
+				dataUrl = canvasOrImg.toDataURL('image/jpeg', 0.95);
 			} catch (e) {}
-		} else if (typeof imageData === 'string') {
-			dataUrl = imageData;
 		}
 
 		if (dataUrl) {
@@ -443,7 +408,7 @@
 			doc.addPage([target_w, target_h], dir);
 		}
 
-		const source = dataUrl || imageData;
+		const source = dataUrl || canvasOrImg;
 		doc.addImage(source, 'JPEG', 0, 0, target_w, target_h, undefined, 'FAST');
 
 		// 严格约束总页数，剔除溢出空白页
@@ -600,7 +565,7 @@
 				</style>
 			</head>
 			<body>
-				${collectedImages.map(item => `<div class="print-page"><img src="${typeof item === 'string' ? item : item.src}" /></div>`).join('')}
+				${collectedImages.map(item => `<div class=\"print-page\"><img src=\"${typeof item === 'string' ? item : item.src}\" /></div>`).join('')}
 			</body>
 			</html>
 		`);
@@ -647,12 +612,13 @@
 			const pages = u.queryAll(select || '#pageContainer .inner_page');
 			const total = pages.length;
 			for (let i = 0; i < total; i++) {
+				if (isAborted) return false;
 				const page = pages[i];
 				page.scrollIntoView({ behavior: 'auto', block: 'center' });
 				u.preview(i + 1, total, `加载第 ${i + 1}/${total} 页`);
-				await u.sleep(300);
+				await u.sleep(250);
 			}
-			return;
+			return true;
 		}
 
 		// 常规滚动容器
@@ -661,21 +627,26 @@
 			let maxScroll = dom.scrollHeight - dom.clientHeight;
 			let current = 0;
 			while (current < maxScroll) {
+				if (isAborted) return false;
 				current += scrollStep;
 				dom.scrollTo({ top: current, behavior: 'smooth' });
 				u.preview(current, maxScroll);
-				await u.sleep(300);
+				await u.sleep(250);
 				maxScroll = dom.scrollHeight - dom.clientHeight;
 			}
+			return true;
 		} else if (select) {
 			const els = u.queryAll(select);
 			const total = els.length;
 			for (let i = 0; i < total; i++) {
+				if (isAborted) return false;
 				els[i].scrollIntoView({ behavior: 'auto', block: 'center' });
 				u.preview(i + 1, total);
-				await u.sleep(250);
+				await u.sleep(200);
 			}
+			return true;
 		}
+		return true;
 	};
 
 	const processAndExtractPages = async () => {
@@ -684,22 +655,22 @@
 		let validCount = 0;
 
 		for (let i = 0; i < length; i++) {
+			if (isAborted) return false;
 			const item = nodes[i];
 			let canvas = item.tagName === 'CANVAS' ? item : item.querySelector('canvas');
 			let img = item.tagName === 'IMG' ? item : item.querySelector('img');
 
 			if ((!canvas || !canvas.width) && (!img || !img.naturalWidth)) {
 				item.scrollIntoView({ behavior: "auto", block: "center" });
-				await u.sleep(300);
+				await u.sleep(250);
 				canvas = item.tagName === 'CANVAS' ? item : item.querySelector('canvas');
 				img = item.tagName === 'IMG' ? item : item.querySelector('img');
 			}
 
-			if (canvas && canvas.width > 0 && canvas.height > 0) {
-				const pageRot = (currentRotation + getElementRotation(canvas || item)) % 360;
-				let activeCanvas = pageRot !== 0 ? rotateCanvas(canvas, pageRot) : canvas;
-				const processedCanvas = cropCanvasWhiteBorders(activeCanvas);
+			if (isAborted) return false;
 
+			if (canvas && canvas.width > 0 && canvas.height > 0) {
+				const processedCanvas = cropCanvasWhiteBorders(canvas);
 				savePageToPDF(processedCanvas, validCount, processedCanvas.width, processedCanvas.height);
 				validCount++;
 			} else if (img && (img.naturalWidth || img.width)) {
@@ -709,15 +680,14 @@
 				const tCtx = tempCanvas.getContext('2d');
 				tCtx.drawImage(img, 0, 0);
 
-				const pageRot = (currentRotation + getElementRotation(img || item)) % 360;
-				let activeCanvas = pageRot !== 0 ? rotateCanvas(tempCanvas, pageRot) : tempCanvas;
-				const processedCanvas = cropCanvasWhiteBorders(activeCanvas);
-
+				const processedCanvas = cropCanvasWhiteBorders(tempCanvas);
 				savePageToPDF(processedCanvas, validCount, processedCanvas.width, processedCanvas.height);
 				validCount++;
 			}
 			await u.preview(i + 1, length, `合成第 ${i + 1}/${length} 页`);
 		}
+
+		if (isAborted) return false;
 
 		console.log(`处理完成，共捕获 ${validCount}/${length} 页`);
 		if (validCount === 0) {
@@ -729,26 +699,37 @@
 
 	const startDownloadPipeline = async () => {
 		if (isRunning) {
-			alert('正在处理中，请稍候...');
+			alert('已有下载任务正在进行中！如需终止请点击【中断下载】');
 			return;
 		}
 		isRunning = true;
+		isAborted = false;
 		resetState();
 		u.preText('正在自动加载...');
 
 		try {
 			// 1. 全量自动滚动与渲染
-			await autoScrollAndRenderAllPages();
+			const scrollOk = await autoScrollAndRenderAllPages();
+			if (isAborted || scrollOk === false) {
+				u.preText('已中断下载');
+				return;
+			}
 
-			// 2. 图像抽取、智能旋转、裁切与 PDF 合成
+			// 2. 图像抽取、裁切与 PDF 合成
 			u.preText('正在生成 PDF...');
-			const ok = await processAndExtractPages();
+			const extractOk = await processAndExtractPages();
+			if (isAborted || extractOk === false) {
+				u.preText('已中断下载');
+				return;
+			}
 
 			// 3. 导出与触发保存
-			if (ok !== false) {
-				exportPDF();
-			}
+			exportPDF();
 		} catch (err) {
+			if (isAborted) {
+				u.preText('已中断下载');
+				return;
+			}
 			console.error('下载流程异常:', err);
 			u.preText('处理出错');
 			alert('下载流程遇到错误：' + (err.message || err));
@@ -757,20 +738,22 @@
 		}
 	};
 
-	// ==================== 界面交互与初始化 ====================
-	const toggleRotation = () => {
-		currentRotation = (currentRotation + 90) % 360;
-		const rotateBtn = document.getElementById(prefix + 'rotate');
-		if (rotateBtn) {
-			rotateBtn.textContent = `🔄 旋转: ${currentRotation}°`;
+	const stopDownloadPipeline = () => {
+		if (!isRunning) {
+			u.preText('当前未在下载');
+			setTimeout(() => u.preText('文档免费下载'), 2000);
+			return;
 		}
-		u.preText(currentRotation === 0 ? '默认方向' : `已设为旋转 ${currentRotation}°`);
+		isAborted = true;
+		isRunning = false;
+		u.preText('已中断下载');
 	};
 
+	// ==================== 界面交互与初始化 ====================
 	const btns = [
 		new Box('text', '文档免费下载', null),
 		new Box('pdf', '📥 下载 PDF', () => startDownloadPipeline()),
-		new Box('rotate', '🔄 旋转: 0°', () => toggleRotation())
+		new Box('stop', '🛑 中断下载', () => stopDownloadPipeline())
 	];
 
 	const init = () => {
