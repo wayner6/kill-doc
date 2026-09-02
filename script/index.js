@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         文档免费下载
 // @namespace    https://github.com/wayner6/kill-doc
-// @version      8.3.0
+// @version      8.3.1
 // @description  基于 kill-doc 深度重构与二次开发。点击下载自动强制全量预览并导出高清 1:1 原貌尺寸 PDF/图片/纯文本，杜绝死锁与白边。
 // @author       kill-doc-dev (基于 Mr.Fang 二次开发修复)
 // @downloadURL  https://raw.githubusercontent.com/wayner6/kill-doc/master/script/index.js
@@ -460,7 +460,12 @@
 		}
 
 		if (dataUrl) {
-			collectedImages.push(dataUrl);
+			collectedImages.push({
+				src: dataUrl,
+				width: target_w,
+				height: target_h,
+				orientation: dir
+			});
 		}
 
 		// 动态自适应页面尺寸：PPT等宽屏文档自动生成横版页面，Word等纵向文档自动生成竖版页面
@@ -537,6 +542,10 @@
 		iframe.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0;';
 		document.body.appendChild(iframe);
 
+		const firstPage = collectedImages[0] || {};
+		const isLandscape = (firstPage.width && firstPage.height) ? (firstPage.width > firstPage.height) : true;
+		const orientationCss = isLandscape ? 'landscape' : 'portrait';
+
 		const docIframe = iframe.contentWindow.document;
 		docIframe.open();
 		docIframe.write(`
@@ -546,7 +555,7 @@
 				<title>${safeTitle}</title>
 				<style>
 					@page {
-						size: auto;
+						size: ${orientationCss};
 						margin: 0mm !important;
 					}
 					* {
@@ -578,17 +587,15 @@
 						break-after: avoid !important;
 					}
 					img {
-						max-width: 100vw;
-						max-height: 100vh;
-						width: auto;
-						height: auto;
+						width: 100%;
+						height: 100%;
 						object-fit: contain;
 						display: block;
 					}
 				</style>
 			</head>
 			<body>
-				${collectedImages.map(src => `<div class="print-page"><img src="${src}" /></div>`).join('')}
+				${collectedImages.map(item => `<div class="print-page"><img src="${typeof item === 'string' ? item : item.src}" /></div>`).join('')}
 			</body>
 			</html>
 		`);
