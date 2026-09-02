@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         文档免费下载
 // @namespace    https://github.com/wayner6/kill-doc
-// @version      8.4.0
+// @version      8.4.1
 // @description  基于 kill-doc 深度重构与二次开发。点击下载自动强制全量预览并导出高清 1:1 原貌尺寸 PDF/图片/纯文本，杜绝死锁与白边。
 // @author       kill-doc-dev (基于 Mr.Fang 二次开发修复)
 // @downloadURL  https://raw.githubusercontent.com/wayner6/kill-doc/master/script/index.js
@@ -326,18 +326,14 @@
 	const params = new URLSearchParams(window.location.search);
 	const jsPDF = jspdf.jsPDF;
 
-	let zipWriter = null;
-	let zipTasks = [];
+	let collectedBlobs = [];
 	let collectedImages = [];
 	let doc = null;
+	let currentRotation = 0; // 0, 90, 180, 270
 
 	const resetDocAndZip = () => {
 		doc = null;
-		zipWriter = new zip.ZipWriter(new zip.BlobWriter("application/zip"), {
-			bufferedWrite: true,
-			useCompressionStream: false
-		});
-		zipTasks = [];
+		collectedBlobs = [];
 		collectedImages = [];
 	};
 	resetDocAndZip();
@@ -425,10 +421,20 @@
 		}
 	};
 
+	const toggleRotation = () => {
+		currentRotation = (currentRotation + 90) % 360;
+		const rotateBtn = document.getElementById(prefix + 'rotate');
+		if (rotateBtn) {
+			rotateBtn.textContent = `🔄 旋转: ${currentRotation}°`;
+		}
+		u.preText(currentRotation === 0 ? '默认方向' : `已设为旋转 ${currentRotation}°`);
+	};
+
 	const btns = [
 		new Box('text', '文档免费下载', null),
 		new Box('pdf', '📥 下载 PDF', () => startDownloadPipeline(1)),
-		new Box('down', '🖼️ 下载图片', () => startDownloadPipeline(2))
+		new Box('down', '🖼️ 下载图片', () => startDownloadPipeline(2)),
+		new Box('rotate', '🔄 旋转: 0°', () => toggleRotation())
 	];
 
 	const before = () => {
@@ -439,12 +445,49 @@
 		}
 	};
 
+	const rotateCanvas = (canvas, degrees) => {
+		if (!degrees || degrees % 360 === 0) return canvas;
+		const deg = (degrees % 360 + 360) % 360;
+		const rad = deg * Math.PI / 180;
+		const rotated = document.createElement('canvas');
+		if (deg === 90 || deg === 270) {
+			rotated.width = canvas.height;
+			rotated.height = canvas.width;
+		} else {
+			rotated.width = canvas.width;
+			rotated.height = canvas.height;
+		}
+		const ctx = rotated.getContext('2d');
+		ctx.fillStyle = '#FFFFFF';
+		ctx.fillRect(0, 0, rotated.width, rotated.height);
+		ctx.translate(rotated.width / 2, rotated.height / 2);
+		ctx.rotate(rad);
+		ctx.drawImage(canvas, -canvas.width / 2, -canvas.height / 2);
+		return rotated;
+	};
+
+	const getElementRotation = (el) => {
+		let curr = el;
+		while (curr && curr !== document.body) {
+			const style = window.getComputedStyle(curr);
+			const transform = style.transform || style.webkitTransform;
+			if (transform && transform !== 'none') {
+				const match = transform.match(/matrix\(([^)]+)\)/);
+				if (match) {
+					const values = match[1].split(',').map(parseFloat);
+					const angle = Math.round(Math.atan2(values[1], values[0]) * (180 / Math.PI));
+					if (angle !== 0) return (angle + 360) % 360;
+				}
+			}
+			curr = curr.parentElement;
+		}
+		return 0;
+	};
+
 	const cropCanvasWhiteBorders = (canvas) => {
 		if (!canvas || !canvas.width || !canvas.height) return canvas;
 		const width = canvas.width;
 		const height = canvas.height;
-		// 仅当高度明显大于宽度（如 PPT 宽屏文档被平台嵌套在竖版 A4 框架中）时，自动探测并裁切上下大面积留白
-		if (height <= width) return canvas;
 
 		try {
 			const ctx = canvas.getContext('2d');
@@ -487,7 +530,7 @@
 
 			const cropH = bottom - top;
 			// 存在明显上下白边且主体高度合理时才裁切，精准还原横版 PPT 比例
-			if ((top > 25 || bottom < height - 25) && cropH > 100) {
+			if ((top > 20 || bottom < height - 20) && cropH > 100) {
 				const croppedCanvas = document.createElement('canvas');
 				croppedCanvas.width = width;
 				croppedCanvas.height = cropH;
@@ -511,13 +554,11 @@
 		const target_h = Math.round(naturalH);
 		const dir = target_w > target_h ? 'l' : 'p';
 
-		if (blob && zipWriter) {
-			try {
-				const task = zipWriter.add(`${i + 1}.png`, new zip.BlobReader(blob));
-				zipTasks.push(task);
-			} catch (e) {
-				console.warn('添加 zip 条目失败:', e);
-			}
+		if (blob) {
+			collectedBlobs.push({
+				name: `${i + 1}.png`,
+				blob: blob
+			});
 		}
 
 		// 保存渲染数据用于直接打印或备用
@@ -728,9 +769,19 @@
 	const downzip = async () => {
 		const safeTitle = (title || 'document').replace(/[\\/:*?"<>|\r\n\t]/g, '_').trim();
 		try {
+			if (!collectedBlobs || collectedBlobs.length === 0) {
+				alert('未收集到图片数据，请重新点击下载！');
+				return;
+			}
 			u.preText('正在打包图片...');
-			if (zipTasks && zipTasks.length > 0) {
-				await Promise.all(zipTasks);
+			const zipWriter = new zip.ZipWriter(new zip.BlobWriter("application/zip"), {
+				bufferedWrite: true,
+				useCompressionStream: false
+			});
+			for (let i = 0; i < collectedBlobs.length; i++) {
+				const item = collectedBlobs[i];
+				u.preview(i + 1, collectedBlobs.length, `压缩第 ${i + 1}/${collectedBlobs.length} 页`);
+				await zipWriter.add(item.name, new zip.BlobReader(item.blob));
 			}
 			const blob = await zipWriter.close();
 			showDownloadDialog(safeTitle, blob, 'zip');
@@ -738,7 +789,7 @@
 			u.preText('下载完成');
 		} catch (error) {
 			console.error('打包或下载 ZIP 失败:', error);
-			alert('打包图片失败，请重新尝试！');
+			alert('打包图片失败：' + (error.message || error));
 		}
 	};
 
@@ -839,14 +890,26 @@
 			}
 
 			if (canvas && canvas.width > 0 && canvas.height > 0) {
-				const processedCanvas = cropCanvasWhiteBorders(canvas);
+				const pageRot = (currentRotation + getElementRotation(canvas || item)) % 360;
+				let activeCanvas = pageRot !== 0 ? rotateCanvas(canvas, pageRot) : canvas;
+				const processedCanvas = cropCanvasWhiteBorders(activeCanvas);
+
 				let { blob, width, height } = await MF_CanvasToBase64(processedCanvas);
 				saveImageAndPDF(processedCanvas, blob, validCount, width, height);
 				validCount++;
 			} else if (img && (img.naturalWidth || img.width)) {
-				let width = img.naturalWidth || img.width;
-				let height = img.naturalHeight || img.height;
-				saveImageAndPDF(img, null, validCount, width, height);
+				let tempCanvas = document.createElement('canvas');
+				tempCanvas.width = img.naturalWidth || img.width;
+				tempCanvas.height = img.naturalHeight || img.height;
+				const tCtx = tempCanvas.getContext('2d');
+				tCtx.drawImage(img, 0, 0);
+
+				const pageRot = (currentRotation + getElementRotation(img || item)) % 360;
+				let activeCanvas = pageRot !== 0 ? rotateCanvas(tempCanvas, pageRot) : tempCanvas;
+				const processedCanvas = cropCanvasWhiteBorders(activeCanvas);
+
+				let { blob, width, height } = await MF_CanvasToBase64(processedCanvas);
+				saveImageAndPDF(processedCanvas, blob, validCount, width, height);
 				validCount++;
 			}
 			await u.preview(i + 1, length);
