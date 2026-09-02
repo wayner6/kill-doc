@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         文档免费下载
 // @namespace    https://github.com/wayner6/kill-doc
-// @version      8.2.0
-// @description  基于 kill-doc 深度重构与二次开发。点击下载自动强制全量预览并导出高清 PDF/图片/纯文本，杜绝死锁与弹窗拦截。
+// @version      8.3.0
+// @description  基于 kill-doc 深度重构与二次开发。点击下载自动强制全量预览并导出高清 1:1 原貌尺寸 PDF/图片/纯文本，杜绝死锁与白边。
 // @author       kill-doc-dev (基于 Mr.Fang 二次开发修复)
 // @downloadURL  https://raw.githubusercontent.com/wayner6/kill-doc/master/script/index.js
 // @updateURL    https://raw.githubusercontent.com/wayner6/kill-doc/master/script/index.js
@@ -437,10 +437,13 @@
 		}
 	};
 
-	const saveImageAndPDF = (imageData, blob, i, width, height, natural = false) => {
-		let target_w = width || pdf_w;
-		let target_h = height || pdf_h;
-		let dir = target_w > target_h ? 'l' : 'p';
+	const saveImageAndPDF = (imageData, blob, i, width, height) => {
+		// 动态获取原始天然宽高，实现全局所有站点 1:1 原貌自适应
+		const naturalW = width || (imageData && (imageData.naturalWidth || imageData.width)) || 595;
+		const naturalH = height || (imageData && (imageData.naturalHeight || imageData.height)) || 842;
+		const target_w = Math.round(naturalW);
+		const target_h = Math.round(naturalH);
+		const dir = target_w > target_h ? 'l' : 'p';
 
 		if (blob) {
 			zipWriter.add(`${i}.png`, new zip.BlobReader(blob));
@@ -460,7 +463,7 @@
 			collectedImages.push(dataUrl);
 		}
 
-		// 使用 pt 原生点阵单位（1pt = 1/72in），规避 px 缩放因子导致的尺寸溢出与自动换页
+		// 动态自适应页面尺寸：PPT等宽屏文档自动生成横版页面，Word等纵向文档自动生成竖版页面
 		if (!doc || i === 0) {
 			doc = new jsPDF({
 				orientation: dir,
@@ -475,7 +478,7 @@
 		const source = dataUrl || imageData;
 		doc.addImage(source, 'JPEG', 0, 0, target_w, target_h, undefined, 'FAST');
 
-		// 强制校验与自愈：确保第 i 张图添加后，当前 PDF 总页数严格等于 i + 1，多余的溢出页立即删除
+		// 强制校验与自愈：确保页数严格匹配，剔除意外溢出页
 		while (doc.getNumberOfPages() > i + 1) {
 			doc.deletePage(doc.getNumberOfPages());
 		}
@@ -735,20 +738,27 @@
 		for (let i = 0; i < length; i++) {
 			let item = nodes[i];
 			let canvas = item.tagName === 'CANVAS' ? item : item.querySelector('canvas');
-			if (!canvas || !canvas.width || canvas.width === 0) {
+			let img = item.tagName === 'IMG' ? item : item.querySelector('img');
+
+			if ((!canvas || !canvas.width) && (!img || !img.naturalWidth)) {
 				item.scrollIntoView({
 					behavior: "auto",
 					block: "center"
 				});
 				await u.sleep(300);
 				canvas = item.tagName === 'CANVAS' ? item : item.querySelector('canvas');
+				img = item.tagName === 'IMG' ? item : item.querySelector('img');
 			}
-			if (canvas && canvas.width > 0) {
+
+			if (canvas && canvas.width > 0 && canvas.height > 0) {
 				let { blob, width, height } = await MF_CanvasToBase64(canvas);
-				if (width && height) {
-					saveImageAndPDF(canvas, blob, validCount, width, height, host.includes(domain.doc88) || host.includes(domain.jtst) || host.includes(domain.rbtest));
-					validCount++;
-				}
+				saveImageAndPDF(canvas, blob, validCount, width, height);
+				validCount++;
+			} else if (img && (img.naturalWidth || img.width)) {
+				let width = img.naturalWidth || img.width;
+				let height = img.naturalHeight || img.height;
+				saveImageAndPDF(img, null, validCount, width, height);
+				validCount++;
 			}
 			await u.preview(i + 1, length);
 		}
