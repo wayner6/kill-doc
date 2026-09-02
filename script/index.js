@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         文档免费下载
 // @namespace    https://github.com/wayner6/kill-doc
-// @version      8.3.1
+// @version      8.4.0
 // @description  基于 kill-doc 深度重构与二次开发。点击下载自动强制全量预览并导出高清 1:1 原貌尺寸 PDF/图片/纯文本，杜绝死锁与白边。
 // @author       kill-doc-dev (基于 Mr.Fang 二次开发修复)
 // @downloadURL  https://raw.githubusercontent.com/wayner6/kill-doc/master/script/index.js
@@ -327,6 +327,7 @@
 	const jsPDF = jspdf.jsPDF;
 
 	let zipWriter = null;
+	let zipTasks = [];
 	let collectedImages = [];
 	let doc = null;
 
@@ -336,6 +337,7 @@
 			bufferedWrite: true,
 			useCompressionStream: false
 		});
+		zipTasks = [];
 		collectedImages = [];
 	};
 	resetDocAndZip();
@@ -437,6 +439,70 @@
 		}
 	};
 
+	const cropCanvasWhiteBorders = (canvas) => {
+		if (!canvas || !canvas.width || !canvas.height) return canvas;
+		const width = canvas.width;
+		const height = canvas.height;
+		// 仅当高度明显大于宽度（如 PPT 宽屏文档被平台嵌套在竖版 A4 框架中）时，自动探测并裁切上下大面积留白
+		if (height <= width) return canvas;
+
+		try {
+			const ctx = canvas.getContext('2d');
+			const imgData = ctx.getImageData(0, 0, width, height);
+			const data = imgData.data;
+
+			let top = 0;
+			for (let y = 0; y < height; y++) {
+				let hasContent = false;
+				for (let x = 0; x < width; x += 4) {
+					const idx = (y * width + x) * 4;
+					const r = data[idx], g = data[idx + 1], b = data[idx + 2], a = data[idx + 3];
+					if (a > 20 && (r < 245 || g < 245 || b < 245)) {
+						hasContent = true;
+						break;
+					}
+				}
+				if (hasContent) {
+					top = Math.max(0, y - 2);
+					break;
+				}
+			}
+
+			let bottom = height;
+			for (let y = height - 1; y >= 0; y--) {
+				let hasContent = false;
+				for (let x = 0; x < width; x += 4) {
+					const idx = (y * width + x) * 4;
+					const r = data[idx], g = data[idx + 1], b = data[idx + 2], a = data[idx + 3];
+					if (a > 20 && (r < 245 || g < 245 || b < 245)) {
+						hasContent = true;
+						break;
+					}
+				}
+				if (hasContent) {
+					bottom = Math.min(height, y + 3);
+					break;
+				}
+			}
+
+			const cropH = bottom - top;
+			// 存在明显上下白边且主体高度合理时才裁切，精准还原横版 PPT 比例
+			if ((top > 25 || bottom < height - 25) && cropH > 100) {
+				const croppedCanvas = document.createElement('canvas');
+				croppedCanvas.width = width;
+				croppedCanvas.height = cropH;
+				const cCtx = croppedCanvas.getContext('2d');
+				cCtx.fillStyle = '#FFFFFF';
+				cCtx.fillRect(0, 0, width, cropH);
+				cCtx.drawImage(canvas, 0, top, width, cropH, 0, 0, width, cropH);
+				return croppedCanvas;
+			}
+		} catch (e) {
+			console.warn('Canvas 边缘探测跳过:', e);
+		}
+		return canvas;
+	};
+
 	const saveImageAndPDF = (imageData, blob, i, width, height) => {
 		// 动态获取原始天然宽高，实现全局所有站点 1:1 原貌自适应
 		const naturalW = width || (imageData && (imageData.naturalWidth || imageData.width)) || 595;
@@ -445,8 +511,13 @@
 		const target_h = Math.round(naturalH);
 		const dir = target_w > target_h ? 'l' : 'p';
 
-		if (blob) {
-			zipWriter.add(`${i}.png`, new zip.BlobReader(blob));
+		if (blob && zipWriter) {
+			try {
+				const task = zipWriter.add(`${i + 1}.png`, new zip.BlobReader(blob));
+				zipTasks.push(task);
+			} catch (e) {
+				console.warn('添加 zip 条目失败:', e);
+			}
 		}
 
 		// 保存渲染数据用于直接打印或备用
@@ -489,7 +560,7 @@
 		}
 	};
 
-	const showDownloadDialog = (safeTitle, pdfBlob) => {
+	const showDownloadDialog = (safeTitle, fileBlob, type = 'pdf') => {
 		let oldDialog = document.getElementById('mf-download-dialog');
 		if (oldDialog) oldDialog.remove();
 
@@ -497,19 +568,22 @@
 		dialog.id = 'mf-download-dialog';
 		dialog.style.cssText = 'position:fixed;top:30px;right:30px;z-index:2147483647;background:#ffffff;border:2px solid #0066ff;border-radius:10px;padding:18px 22px;box-shadow:0 8px 30px rgba(0,0,0,0.25);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;min-width:320px;max-width:420px;';
 
-		const blobUrl = pdfBlob ? URL.createObjectURL(pdfBlob) : null;
+		const blobUrl = fileBlob ? URL.createObjectURL(fileBlob) : null;
+		const isZip = type === 'zip';
+		const fileName = isZip ? `${safeTitle}.zip` : `${safeTitle}.pdf`;
+		const buttonText = isZip ? '📦 点击保存 ZIP 压缩包' : '📥 点击保存 PDF';
 
 		dialog.innerHTML = `
 			<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-				<span style="font-weight:bold;color:#0066ff;font-size:16px;">🎉 文档已生成就绪</span>
+				<span style="font-weight:bold;color:#0066ff;font-size:16px;">🎉 ${isZip ? '图片已打包完成' : '文档已生成就绪'}</span>
 				<span id="mf-close-btn" style="cursor:pointer;font-size:20px;color:#999;font-weight:bold;line-height:1;">&times;</span>
 			</div>
 			<div style="font-size:13px;color:#333;margin-bottom:15px;word-break:break-all;line-height:1.5;">
-				${safeTitle}
+				${fileName}
 			</div>
 			<div style="display:flex;gap:10px;flex-wrap:wrap;">
-				${blobUrl ? `<a id="mf-direct-download" href="${blobUrl}" download="${safeTitle}.pdf" style="flex:1;text-align:center;padding:10px 14px;background:#0066ff;color:#fff;border-radius:6px;text-decoration:none;font-size:13px;font-weight:bold;cursor:pointer;display:inline-block;box-shadow:0 2px 6px rgba(0,102,255,0.3);">📥 点击保存 PDF</a>` : ''}
-				<button id="mf-print-btn" style="flex:1;padding:10px 14px;background:#28a745;color:#fff;border:none;border-radius:6px;font-size:13px;font-weight:bold;cursor:pointer;box-shadow:0 2px 6px rgba(40,167,69,0.3);">🖨️ 打印另存为</button>
+				${blobUrl ? `<a id="mf-direct-download" href="${blobUrl}" download="${fileName}" style="flex:1;text-align:center;padding:10px 14px;background:#0066ff;color:#fff;border-radius:6px;text-decoration:none;font-size:13px;font-weight:bold;cursor:pointer;display:inline-block;box-shadow:0 2px 6px rgba(0,102,255,0.3);">${buttonText}</a>` : ''}
+				${!isZip ? `<button id="mf-print-btn" style="flex:1;padding:10px 14px;background:#28a745;color:#fff;border:none;border-radius:6px;font-size:13px;font-weight:bold;cursor:pointer;box-shadow:0 2px 6px rgba(40,167,69,0.3);">🖨️ 打印另存为</button>` : ''}
 			</div>
 		`;
 
@@ -651,13 +725,21 @@
 		}, 10000);
 	};
 
-	const downzip = () => {
+	const downzip = async () => {
 		const safeTitle = (title || 'document').replace(/[\\/:*?"<>|\r\n\t]/g, '_').trim();
-		zipWriter.close().then(blob => {
+		try {
+			u.preText('正在打包图片...');
+			if (zipTasks && zipTasks.length > 0) {
+				await Promise.all(zipTasks);
+			}
+			const blob = await zipWriter.close();
+			showDownloadDialog(safeTitle, blob, 'zip');
 			MF_SafeDownload(blob, `${safeTitle}.zip`);
-		}).catch(error => {
-			console.error(error);
-		});
+			u.preText('下载完成');
+		} catch (error) {
+			console.error('打包或下载 ZIP 失败:', error);
+			alert('打包图片失败，请重新尝试！');
+		}
 	};
 
 	const downpdf = () => {
@@ -703,13 +785,12 @@
 		MF_SafeDownload(blob, `${title || 'text'}.txt`);
 	};
 
-	const conditionDownload = () => {
+	const conditionDownload = async () => {
 		if (downType === 1) {
 			downpdf();
 		} else if (downType === 2) {
-			downzip();
+			await downzip();
 		}
-		u.preText('下载完成');
 	};
 
 	const MF_CanvasToBase64 = (canvas) => {
@@ -758,8 +839,9 @@
 			}
 
 			if (canvas && canvas.width > 0 && canvas.height > 0) {
-				let { blob, width, height } = await MF_CanvasToBase64(canvas);
-				saveImageAndPDF(canvas, blob, validCount, width, height);
+				const processedCanvas = cropCanvasWhiteBorders(canvas);
+				let { blob, width, height } = await MF_CanvasToBase64(processedCanvas);
+				saveImageAndPDF(processedCanvas, blob, validCount, width, height);
 				validCount++;
 			} else if (img && (img.naturalWidth || img.width)) {
 				let width = img.naturalWidth || img.width;
